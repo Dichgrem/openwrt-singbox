@@ -1,0 +1,134 @@
+name: Build OpenWrt sing-box latest
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+permissions:
+  contents: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      build: ${{ steps.check.outputs.build }}
+    steps:
+      - name: Get latest sing-box version
+        id: version
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            | jq -r .tag_name)
+          echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+      - name: Check if built
+        id: check
+        run: |
+          TAG="singbox-v${{ steps.version.outputs.version }}"
+          if git ls-remote --tags \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" \
+            | grep -q "refs/tags/$TAG$"; then
+            echo "build=false" >> $GITHUB_OUTPUT
+          else
+            echo "build=true" >> $GITHUB_OUTPUT
+          fi
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86/64
+            sdk: openwrt-sdk-25.12.0-x86-64_gcc-14.3.0_musl.Linux-x86_64
+          - arch: aarch64_cortex-a53
+            target: mediatek/filogic
+            sdk: openwrt-sdk-25.12.0-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git \
+            libncurses-dev libssl-dev python3-setuptools \
+            rsync swig unzip zlib1g-dev file wget curl jq
+      - name: Prepare signing key
+        run: |
+          mkdir -p ~/.abuild
+          echo "${{ secrets.REPO_KEY }}" > ~/.abuild/repo.rsa
+          echo "${{ secrets.REPO_PUB }}" > ~/.abuild/repo.rsa.pub
+          chmod 600 ~/.abuild/repo.rsa
+      - name: Download OpenWrt SDK
+        run: |
+          URL="https://downloads.openwrt.org/releases/25.12.0/targets/${{ matrix.target }}/${{ matrix.sdk }}.tar.zst"
+          wget -q "$URL"
+          tar xf "${{ matrix.sdk }}.tar.zst"
+          mv "${{ matrix.sdk }}" sdk
+      - name: Setup feeds
+        run: |
+          cd sdk
+          ./scripts/feeds update -a
+          ./scripts/feeds install sing-box
+      - name: Patch Makefile
+        run: |
+          VER="${{ needs.check.outputs.version }}"
+          MK="sdk/feeds/packages/net/sing-box/Makefile"
+          wget -q -O /tmp/sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/archive/refs/tags/v${VER}.tar.gz"
+          HASH=$(sha256sum /tmp/sing-box.tar.gz | awk '{print $1}')
+          mkdir -p sdk/dl
+          cp /tmp/sing-box.tar.gz "sdk/dl/sing-box-${VER}.tar.gz"
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=${VER}/" "$MK"
+          sed -i "s/^PKG_HASH:=.*/PKG_HASH:=${HASH}/" "$MK"
+      - name: Compile
+        run: |
+          cd sdk
+          make defconfig
+          make package/sing-box/compile -j$(nproc) V=s
+      - name: Collect & sign packages
+        run: |
+          ARCH="${{ matrix.arch }}"
+          mkdir -p repo/${ARCH}
+          find sdk/bin/packages -name "sing-box*.apk" -exec cp {} repo/${ARCH}/ \;
+          docker run --rm \
+            -v "$PWD/repo/${ARCH}:/work" \
+            -v "$HOME/.abuild/repo.rsa:/signing/repo.rsa:ro" \
+            -v "$HOME/.abuild/repo.rsa.pub:/signing/repo.rsa.pub:ro" \
+            alpine sh -c "
+              apk add --no-cache abuild
+              cd /work
+              apk index -o APKINDEX.tar.gz *.apk
+              abuild-sign -k /signing/repo.rsa APKINDEX.tar.gz
+              cp /signing/repo.rsa.pub .
+            "
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-${{ matrix.arch }}
+          path: repo/${{ matrix.arch }}
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: repo
+      - name: Fix artifact directory structure
+        run: |
+          for d in repo/repo-*; do
+            mv "$d" "repo/${d#repo/repo-}"
+          done
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: repo
+          keep_files: true
+      - name: Tag this build
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "singbox-v${{ needs.check.outputs.version }}"
+          git push origin "singbox-v${{ needs.check.outputs.version }}"
